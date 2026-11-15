@@ -1,0 +1,12 @@
+# Core Cryptography & Security
+cryptography>=42.0.0
+bcrypt>=4.1.0
+
+# Environment & Configuration Management
+python-dotenv>=1.0.0
+
+# Terminal UI & Formatting
+rich>=13.7.0
+
+# Testing & Quality Assurance
+pytest>=8.0.0

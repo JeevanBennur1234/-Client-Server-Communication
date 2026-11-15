@@ -1,0 +1,1 @@
+# Keep server/certs directory tracked in git while ignoring private keys and certificates
