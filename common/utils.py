@@ -271,6 +271,22 @@ def recv_msg(
 # ==============================================================================
 
 
+def sanitize_received_filename(filename: Any, default: str = "received.dat") -> str:
+    """Return a safe basename for a filename received from a remote peer.
+
+    Normalize both POSIX and Windows separators regardless of the local OS,
+    remove NUL bytes, and fall back for empty or dot-only names.
+    """
+    if not isinstance(filename, str):
+        return default
+
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    basename = basename.replace("\x00", "").strip()
+    if basename in {"", ".", ".."}:
+        return default
+    return basename
+
+
 def compute_bytes_sha256(data: bytes) -> str:
     """Calculate SHA-256 hex digest for arbitrary bytes.
 
@@ -408,6 +424,7 @@ __all__ = [
     "format_system_message",
     "send_msg",
     "recv_msg",
+    "sanitize_received_filename",
     "compute_bytes_sha256",
     "compute_file_sha256",
     "generate_ecdh_keypair",

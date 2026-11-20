@@ -100,9 +100,20 @@ class TestMessageTransmission:
         large_string = "A" * (1024 * 1024)  # 1 MB
         payload = {"type": "file_test", "data": large_string}
 
-        send_msg(s1, payload)
-        received = recv_msg(s2)
+        received_messages = []
+        receiver = threading.Thread(
+            target=lambda: received_messages.append(recv_msg(s2)),
+            daemon=True,
+        )
+        receiver.start()
 
+        # Read concurrently: the payload can exceed the socket-pair send buffer.
+        send_msg(s1, payload)
+        receiver.join(timeout=5)
+
+        assert not receiver.is_alive(), "receiver thread hung during large-payload read"
+        assert received_messages, "receiver did not return a message"
+        received = received_messages[0]
         assert received is not None
         assert received.get("type") == "file_test"
         assert len(received.get("data", "")) == len(large_string)

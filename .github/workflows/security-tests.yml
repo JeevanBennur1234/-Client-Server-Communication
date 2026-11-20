@@ -1,0 +1,35 @@
+name: CNS Security Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# A PR gets one active test run. New commits cancel obsolete runs.
+concurrency:
+  group: cns-security-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Generate disposable test PKI
+        run: python generate_certs.py
+      - name: Run complete test suite with per-suite timeout
+        run: timeout --signal=TERM --kill-after=30s 8m pytest -vv -ra

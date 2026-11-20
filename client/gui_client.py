@@ -58,6 +58,7 @@ from common.utils import (
     get_current_timestamp,
     recv_msg,
     send_msg,
+    sanitize_received_filename,
 )
 
 # ------------------------------------------------------------------------------
@@ -1264,7 +1265,7 @@ class SecureSocketGUI:
     def _handle_file_start(self, msg: Dict[str, Any]) -> None:
         transfer_id = msg.get("transfer_id", "")
         sender = msg.get("sender", "Unknown")
-        filename = os.path.basename(msg.get("filename", "received.dat"))
+        filename = sanitize_received_filename(msg.get("filename", "received.dat"))
         filesize = msg.get("filesize", 0)
         sha256 = msg.get("sha256", "")
         total_chunks = msg.get("total_chunks", 1)

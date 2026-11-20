@@ -47,6 +47,7 @@ from common.utils import (
     send_msg,
     setup_logger,
 )
+from server.security_monitor import SecurityMonitor
 from server.auth import (
     LOCKOUT_DURATION_SECONDS,
     MAX_FAILED_ATTEMPTS,
@@ -134,6 +135,7 @@ class SecureSocketServer:
         self._is_running: threading.Event = threading.Event()
         self._server_sock: Optional[socket.socket] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
+        self.security_monitor = SecurityMonitor(PROJECT_ROOT / "server" / "security_events.jsonl")
 
     def _audit(
         self,
@@ -159,6 +161,9 @@ class SecureSocketServer:
             f"[EVENT: {event_type:<16}] [IP: {addr_str:<21}] [USER: {username:<12}] {details}"
         ).strip()
         audit_logger.info(entry)
+        event = self.security_monitor.record(event_type, addr_str.split(":", 1)[0], username, details)
+        if event.get("action", "").startswith("TEMP_BLOCK"):
+            logger.warning("SECURITY DEFENSE: temporarily blocked source IP %s after repeated suspicious activity.", event["source_ip"])
 
     def _init_ssl_context(self) -> ssl.SSLContext:
         """Create and configure server-side TLS context with mTLS security restrictions.
@@ -591,8 +596,12 @@ class SecureSocketServer:
                         "timestamp": dm_timestamp,
                         "is_echo": True,
                         "e2ee": is_e2ee,
-                        "message": dm_text,
                     }
+                    if is_e2ee:
+                        dm_payload_sender["ciphertext"] = ciphertext
+                        dm_payload_sender["iv"] = iv
+                    else:
+                        dm_payload_sender["message"] = dm_text
                     send_msg(tls_sock, dm_payload_sender)
 
                     audit_detail = (
@@ -803,7 +812,7 @@ class SecureSocketServer:
                     }
 
                     # Log message receipt
-                    logger.info("[CHAT] [%s] %s: %s", timestamp, username, text)
+                    logger.info("[CHAT] [%s] %s sent a public message (%d chars).", timestamp, username, len(text))
                     self._audit("PUBLIC_CHAT", client_addr, username, f"Length: {len(text)} chars")
 
                     # Broadcast to all clients (including sender for acknowledgment)
@@ -811,6 +820,7 @@ class SecureSocketServer:
 
                 else:
                     logger.warning("Received unhandled action '%s' from user '%s'", action, username)
+                    self._audit("PROTOCOL_INVALID", client_addr, username, "Unknown application action")
 
         except (ConnectionResetError, ssl.SSLError, OSError) as exc:
             logger.warning("Connection lost with client %s (%s): %s", username or "unauthenticated", client_addr, exc)
@@ -884,6 +894,12 @@ class SecureSocketServer:
                     continue
                 except OSError:
                     break
+
+                blocked, remaining = self.security_monitor.is_blocked(client_addr[0])
+                if blocked:
+                    self._audit("IP_BLOCKED", client_addr, "-", f"Temporary block active; approximately {remaining}s remaining")
+                    raw_client.close()
+                    continue
 
                 logger.info("TCP connection accepted from %s. Initiating TLS handshake...", client_addr)
                 self._audit("TCP_ACCEPTED", client_addr, "-")
