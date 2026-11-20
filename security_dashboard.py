@@ -86,6 +86,29 @@ def run_bruteforce_demo() -> tuple[bool, str]:
         return False, f"Demo could not reach the configured mTLS server: {exc}"
 
 
+def run_invalid_certificate_demo() -> tuple[bool, str]:
+    """Attempt a local TLS connection without presenting a client certificate."""
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(CA_FILE))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    raw = None
+    try:
+        raw = socket.create_connection((HOST, PORT), timeout=5)
+        tls = context.wrap_socket(raw, server_hostname="localhost" if HOST in {"127.0.0.1", "localhost"} else HOST)
+        tls.settimeout(3)
+        try:
+            recv_msg(tls)
+        finally:
+            tls.close()
+        return False, "Unexpected result: the server accepted a client without a trusted client certificate."
+    except (OSError, ssl.SSLError, TimeoutError) as exc:
+        return True, "Server rejected the unauthenticated TLS client as expected: " + str(exc)
+    finally:
+        if raw is not None:
+            try:
+                raw.close()
+            except OSError:
+                pass
+
 st.title("🛡️ CNS Security Operations Center")
 st.caption("Live security telemetry from the socket server. Events are metadata-only; message and file contents are never displayed.")
 with st.sidebar:
@@ -110,8 +133,13 @@ c4.metric("Temporary blocks", blocked)
 
 st.subheader("Attack simulation laboratory")
 st.warning("Only run simulations against your own local CNS server. The brute-force demo creates a disposable account and uses three incorrect passwords; it does not target real users.")
-if st.button("▶ Simulate brute-force login against configured server", type="primary"):
+sim_a, sim_b = st.columns(2)
+if sim_a.button("▶ Simulate brute-force login", type="primary", use_container_width=True):
     ok, message = run_bruteforce_demo()
+    (st.success if ok else st.error)(message)
+    st.rerun()
+if sim_b.button("🪪 Simulate missing client certificate", use_container_width=True):
+    ok, message = run_invalid_certificate_demo()
     (st.success if ok else st.error)(message)
     st.rerun()
 
