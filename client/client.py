@@ -52,6 +52,7 @@ from common.utils import (
     get_current_timestamp,
     recv_msg,
     send_msg,
+    sanitize_received_filename,
     setup_logger,
 )
 
@@ -577,7 +578,7 @@ class SecureSocketClient:
                 elif msg_type == "file_start":
                     transfer_id = msg.get("transfer_id")
                     sender = msg.get("sender")
-                    filename = msg.get("filename")
+                    filename = sanitize_received_filename(msg.get("filename"))
                     filesize = msg.get("filesize", 0)
                     sha256 = msg.get("sha256")
                     total_chunks = msg.get("total_chunks", 1)
