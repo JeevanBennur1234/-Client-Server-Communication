@@ -59,7 +59,7 @@ class SecurityMonitor:
             "event": str(event_type)[:48],
             "source_ip": str(ip)[:64],
             "username": str(username)[:64],
-            "details": str(details).replace("\\r", " ").replace("\\n", " ")[:240],
+            "details": str(details).replace(chr(13), " ").replace(chr(10), " ")[:240],
             "severity": "INFO",
             "action": "RECORDED",
             "simulated": bool(simulated),
@@ -85,5 +85,5 @@ class SecurityMonitor:
 
             self.event_path.parent.mkdir(parents=True, exist_ok=True)
             with self.event_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=True) + "\\n")
+                handle.write(json.dumps(event, ensure_ascii=True) + chr(10))
         return event
