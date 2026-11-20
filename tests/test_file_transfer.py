@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from common.config import CHUNK_SIZE
-from common.utils import compute_bytes_sha256, compute_file_sha256
+from common.utils import compute_bytes_sha256, compute_file_sha256, sanitize_received_filename
 
 
 class TestSha256Hashing:
@@ -146,8 +146,8 @@ class TestPathTraversalSecurity:
         unsafe_filename: str,
         expected_basename: str,
     ) -> None:
-        """os.path.basename ensures filenames cannot traverse into parent directories."""
-        sanitized = os.path.basename(unsafe_filename)
+        """The cross-platform sanitizer prevents POSIX and Windows traversal."""
+        sanitized = sanitize_received_filename(unsafe_filename)
         assert sanitized == expected_basename
 
         # Target write directory
