@@ -88,3 +88,6 @@ ehthumbs.db
 *.log
 *.sqlite3
 *.db
+
+# Runtime intrusion-detection telemetry (contains operational metadata)
+server/security_events.jsonl
