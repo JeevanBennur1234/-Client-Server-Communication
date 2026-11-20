@@ -820,6 +820,7 @@ class SecureSocketServer:
 
                 else:
                     logger.warning("Received unhandled action '%s' from user '%s'", action, username)
+                    self._audit("PROTOCOL_INVALID", client_addr, username, "Unknown application action")
 
         except (ConnectionResetError, ssl.SSLError, OSError) as exc:
             logger.warning("Connection lost with client %s (%s): %s", username or "unauthenticated", client_addr, exc)
