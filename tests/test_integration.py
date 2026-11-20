@@ -100,6 +100,8 @@ def running_server(test_environment):
         auth_timeout=15.0,
     )
 
+    server_inst.security_monitor.event_path = test_audit.with_name("security_events.jsonl")
+
     server_thread = threading.Thread(target=server_inst.start, daemon=True)
     server_thread.start()
 
