@@ -298,6 +298,8 @@ class TestMultiClientInteractionAndE2EE:
         # Alice gets echo confirmation
         e2ee_echo_alice = recv_msg(alice_sock)
         assert e2ee_echo_alice.get("is_echo") is True
+        assert e2ee_echo_alice.get("ciphertext") == ciphertext_b64
+        assert "message" not in e2ee_echo_alice, "E2EE plaintext must never be echoed by the server"
 
         # Bob receives ciphertext payload from server
         e2ee_msg_bob = recv_msg(bob_sock)
