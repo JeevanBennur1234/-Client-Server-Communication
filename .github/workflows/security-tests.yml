@@ -1,13 +1,14 @@
 name: CNS Security Tests
 
 on:
-  push:
-    branches:
-      - main
-      - feature/live-intrusion-defense-dashboard
   pull_request:
     branches:
       - main
+
+# A PR gets one active test run. New commits cancel obsolete runs.
+concurrency:
+  group: cns-security-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -29,5 +31,5 @@ jobs:
           pip install -r requirements.txt
       - name: Generate disposable test PKI
         run: python generate_certs.py
-      - name: Run complete test suite
-        run: pytest
+      - name: Run complete test suite with per-suite timeout
+        run: timeout --signal=TERM --kill-after=30s 8m pytest -vv -ra
