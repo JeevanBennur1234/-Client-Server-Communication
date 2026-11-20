@@ -596,8 +596,12 @@ class SecureSocketServer:
                         "timestamp": dm_timestamp,
                         "is_echo": True,
                         "e2ee": is_e2ee,
-                        "message": dm_text,
                     }
+                    if is_e2ee:
+                        dm_payload_sender["ciphertext"] = ciphertext
+                        dm_payload_sender["iv"] = iv
+                    else:
+                        dm_payload_sender["message"] = dm_text
                     send_msg(tls_sock, dm_payload_sender)
 
                     audit_detail = (
@@ -808,7 +812,7 @@ class SecureSocketServer:
                     }
 
                     # Log message receipt
-                    logger.info("[CHAT] [%s] %s: %s", timestamp, username, text)
+                    logger.info("[CHAT] [%s] %s sent a public message (%d chars).", timestamp, username, len(text))
                     self._audit("PUBLIC_CHAT", client_addr, username, f"Length: {len(text)} chars")
 
                     # Broadcast to all clients (including sender for acknowledgment)
