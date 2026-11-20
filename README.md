@@ -224,6 +224,24 @@ pip install -r requirements.txt
 
 ---
 
+
+## 🛡️ Runtime Intrusion Detection & Security Dashboard
+
+The server now writes metadata-only security events to `server/security_events.jsonl` and applies a rolling-window source-IP defense. Repeated failed logins, TLS handshake failures, plain-HTTP probes, and protocol-invalid activity contribute to a configurable in-process threshold (default: 8 suspicious events in 60 seconds); reaching it temporarily blocks that source IP for 5 minutes. The accept loop rejects connections from currently blocked IPs before attempting TLS. Existing account-level 3-strike lockout remains enabled as a separate control.
+
+**Run the dashboard locally** (start the socket server first):
+
+```bash
+pip install -r requirements.txt
+streamlit run security_dashboard.py --server.address 127.0.0.1
+```
+
+The dashboard shows event timestamps, source IPs, event types, severity, and prevention actions. It does not display credentials, chat bodies, file contents, private keys, or session tokens. Keep it bound to localhost; do not expose this administrative dashboard to an untrusted network.
+
+**Safe attack simulation:** use the dashboard's brute-force demo button only against your own running server. It creates a uniquely named disposable account and submits three incorrect passwords to demonstrate the existing account lockout and live event telemetry. It does not attack real accounts. The simulation is a real connection to the configured mTLS server, not a fabricated dashboard event.
+
+**Limitations:** this is a lightweight application-level detector, not a replacement for a host firewall, network IDS/IPS, upstream DDoS protection, certificate revocation infrastructure, endpoint security, or secure server administration. Source-IP blocking is process-local and resets when the server restarts. A compromised endpoint or stolen valid client certificate remains a separate threat. The file-transfer protocol currently provides TLS transport protection and SHA-256 integrity checks; it does not claim server-blind end-to-end file encryption.
+
 ## 🔐 Public Key Infrastructure (PKI) & Certificates
 
 The system uses a complete 3-tier Public Key Infrastructure (PKI) to implement Mutual TLS (mTLS):
