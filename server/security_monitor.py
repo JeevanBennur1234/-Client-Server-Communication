@@ -17,7 +17,10 @@ from typing import Any
 class SecurityMonitor:
     """Small in-process detector with bounded rolling windows and JSONL events."""
 
-    SUSPICIOUS_EVENTS = {"LOGIN_FAILED", "TLS_FAILED", "HTTP_ON_TLS", "PROTOCOL_INVALID"}
+    SUSPICIOUS_EVENTS = {
+        "LOGIN_FAILED", "TLS_FAILED", "HTTP_ON_TLS", "PROTOCOL_INVALID",
+        "INVITE_FAILED", "ADMIN_AUTH_FAILED", "ACCESS_DENIED", "ACCESS_ENFORCEMENT_BLOCK",
+    }
 
     def __init__(
         self,

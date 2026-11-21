@@ -129,6 +129,7 @@ sequenceDiagram
 - **Brute-Force Account Protection**: Automatically enforces an account lockout for 5 minutes after 3 consecutive failed login attempts. Locks persist across server restarts.
 - **End-to-End Encryption (E2EE)**: Private direct messages use ephemeral Elliptic Curve Diffie-Hellman (ECDH NIST P-256) key agreement with HKDF-SHA256 key derivation and AES-256-GCM authenticated encryption. The server acts strictly as a zero-knowledge ciphertext relay.
 - **Secure Chunked File Transfer (`/sendfile`)**: Streams large binary files in 64 KB blocks. Automatically hashes files with SHA-256 before transmission and recalculates the hash on the receiver to guarantee bit-level integrity.
+- **Administrator-Controlled Admission**: New accounts remain pending until an administrator approves them and issues a one-time 10-minute activation code. Active access can be revoked and currently connected sessions are disconnected.
 - **Real-Time Online User Roster (`/users`)**: Instant query of authenticated active users in the room.
 - **Security Audit Trail (`server/audit.log`)**: Immutable structured audit logs tracking connection origins, TLS cipher suites, authentication successes/failures, brute-force lockouts, and message routing.
 - **Rich Terminal UI**: Beautiful ANSI terminal formatting with styled panels, masked passwords, real-time message streams, and tables using `rich`.
@@ -180,6 +181,7 @@ secure-socket-comm/
 ├── received_files/           # Default save directory for incoming files (auto-generated)
 ├── tests/
 │   ├── __init__.py           # Tests package marker
+│   ├── test_access_control.py # Admin admission, invite expiry, activation & revocation
 │   ├── test_auth.py          # Unit tests: bcrypt, registration, 3-strike lockout
 │   ├── test_framing.py       # Unit tests: 4-byte binary framing & fragmentation
 │   ├── test_file_transfer.py # Unit tests: 64 KB chunking, SHA-256 & bit-tampering
@@ -233,7 +235,7 @@ The server now writes metadata-only security events to `server/security_events.j
 
 ```bash
 pip install -r requirements.txt
-streamlit run security_dashboard.py --server.address 127.0.0.1
+python -m streamlit run security_dashboard.py --server.address 127.0.0.1
 ```
 
 The dashboard shows event timestamps, source IPs, event types, severity, and prevention actions. It does not display credentials, chat bodies, file contents, private keys, or session tokens. Keep it bound to localhost; do not expose this administrative dashboard to an untrusted network.
@@ -241,6 +243,21 @@ The dashboard shows event timestamps, source IPs, event types, severity, and pre
 **Safe attack simulation:** use the dashboard's brute-force demo button only against your own running server. It creates a uniquely named disposable account and submits three incorrect passwords to demonstrate the existing account lockout and live event telemetry. It does not attack real accounts. The simulation is a real connection to the configured mTLS server, not a fabricated dashboard event.
 
 **Limitations:** this is a lightweight application-level detector, not a replacement for a host firewall, network IDS/IPS, upstream DDoS protection, certificate revocation infrastructure, endpoint security, or secure server administration. Source-IP blocking is process-local and resets when the server restarts. A compromised endpoint or stolen valid client certificate remains a separate threat. The file-transfer protocol currently provides TLS transport protection and SHA-256 integrity checks; it does not claim server-blind end-to-end file encryption.
+
+## 🛡️ Administrator-Controlled Chat Admission
+
+New registrations do **not** enter the chat immediately. The socket server stores each account with an admission state:
+
+- **PENDING** — user registered; username/password authentication alone does not permit chat access.
+- **INVITED** — administrator approved the request and issued a personal, random one-time activation code. The code expires after 10 minutes; only its SHA-256 digest is stored on the server.
+- **ACTIVE** — user successfully redeemed the code. Future logins require the user's password but not another invitation code.
+- **REJECTED / REVOKED** — chat access is denied. Revoking an active account closes its current socket session.
+
+The administrator signs in to the local Streamlit Security Operations dashboard with `ADMIN_ACCESS_KEY`. The server generates this random key on first startup and saves it in the ignored local `.env` file. The dashboard sends admin operations over the existing TLS/mTLS socket connection; it must stay bound to `127.0.0.1`.
+
+**Admission flow:** register → pending queue → admin approve → share the one-time code privately → user redeems code → active chat. The server checks the account status before admitting a session and before processing application actions. Old accounts are treated as pending on migration and must be approved again.
+
+The invitation code is an admission credential, **not** a shared chat encryption key. TLS/mTLS protects client-server transport, while private direct messages retain their separate ECDH + HKDF + AES-GCM encryption. Public room messages remain TLS-protected but are not end-to-end encrypted.
 
 ## 🔐 Public Key Infrastructure (PKI) & Certificates
 
@@ -315,7 +332,17 @@ The server displays an informational configuration panel and begins listening fo
 ╰────────────────────── Press Ctrl+C to stop the server ─────────────────────╯
 ```
 
-### Step 2: Start Client Instances
+### Step 2: Start the Admin Dashboard
+
+Open a second terminal while the TLS server is running:
+
+```bash
+python -m streamlit run security_dashboard.py --server.address 127.0.0.1
+```
+
+The server generates `ADMIN_ACCESS_KEY` on first startup and stores it in your local `.env` file (which is ignored by Git). The dashboard reads that value into its masked admin-key field. Authenticate the administrator before managing requests. Do not publish `.env` or expose the dashboard on a public interface.
+
+### Step 3: Start Client Instances
 
 You can launch clients using either the **Modern Desktop GUI** or the **Rich Terminal (CLI)**:
 
@@ -330,6 +357,14 @@ python client/gui_client.py
 python client/client.py
 ```
 *Runs an interactive terminal session with styled panels, masked password inputs, and slash commands.*
+
+### Admission workflow (first login)
+
+1. A new user selects **Register** in the GUI (or option 2 in the CLI). The server stores the account as `PENDING` and closes the connection; no chat window/session is granted.
+2. The administrator refreshes the dashboard. The new username appears under **Pending access requests**.
+3. The administrator selects **Approve**. The dashboard displays an individual one-time activation code. Share it privately with that user; it expires after 10 minutes. **Do not share the admin key.**
+4. The user chooses **Log In**, enters their username/password, and pastes the one-time code into the access-code field. The server consumes the code and only then admits the user to the chat.
+5. On later logins, the user only needs their password. The administrator can reject a request or revoke an active account; revocation closes its active session.
 
 ---
 
@@ -430,7 +465,7 @@ tests/
         └── Security audit trail verification (audit.log)
 ```
 
-**Result: 46 passed in ~8 seconds (100% pass rate).**
+**Verified locally: 54 passed in 10.30 seconds (100% pass rate for the current test suite).**
 
 ---
 
