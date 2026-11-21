@@ -11,7 +11,10 @@ This module implements a production-grade multithreaded socket server:
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
+import secrets
 import signal
 import socket
 import ssl
@@ -56,6 +59,12 @@ from server.auth import (
     is_account_locked,
     register_user,
     user_exists,
+    list_users_for_admin,
+    issue_access_invitation,
+    activate_user_with_access_code,
+    reject_user_access,
+    revoke_user_access,
+    is_user_active,
 )
 
 # Rich components
@@ -87,6 +96,29 @@ def _setup_audit_logger(log_path: Path = AUDIT_LOG_FILE) -> logging.Logger:
 
 
 audit_logger = _setup_audit_logger()
+
+ADMIN_SESSION = "__ADMIN_CONTROL_SESSION__"
+
+
+def _ensure_admin_access_key() -> str:
+    """Load or create the local admin control-plane secret in the ignored .env file."""
+    existing = os.getenv("ADMIN_ACCESS_KEY", "").strip()
+    if existing:
+        return existing
+
+    generated = secrets.token_urlsafe(32)
+    env_path = PROJECT_ROOT / ".env"
+    try:
+        from dotenv import set_key
+        set_key(str(env_path), "ADMIN_ACCESS_KEY", generated)
+    except Exception:
+        with env_path.open("a", encoding="utf-8") as handle:
+            if env_path.exists() and env_path.stat().st_size:
+                handle.write("\n")
+            handle.write(f"ADMIN_ACCESS_KEY={generated}\n")
+    os.environ["ADMIN_ACCESS_KEY"] = generated
+    logger.warning("Admin control key was generated and saved to the ignored project .env file.")
+    return generated
 
 
 class SecureSocketServer:
@@ -136,6 +168,7 @@ class SecureSocketServer:
         self._server_sock: Optional[socket.socket] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
         self.security_monitor = SecurityMonitor(PROJECT_ROOT / "server" / "security_events.jsonl")
+        self.admin_access_key = _ensure_admin_access_key()
 
     def _audit(
         self,
@@ -297,9 +330,19 @@ class SecureSocketServer:
                     logger.info("Client %s disconnected during authentication.", client_addr)
                     return None
 
-                action = msg.get("action", "").lower().strip()
-                username = msg.get("username", "").strip()
-                password = msg.get("password", "")
+                action = str(msg.get("action", "")).lower().strip()
+                username = str(msg.get("username", "")).strip()
+                password = str(msg.get("password", ""))
+
+                if action == "admin_login":
+                    supplied_key = str(msg.get("admin_key", ""))
+                    if supplied_key and hmac.compare_digest(supplied_key, self.admin_access_key):
+                        self._audit("ADMIN_AUTH_SUCCESS", client_addr, "admin")
+                        send_msg(client_sock, {"status": "ok", "role": "admin", "message": "Administrator authenticated."})
+                        return ADMIN_SESSION
+                    self._audit("ADMIN_AUTH_FAILED", client_addr, "admin", "Invalid admin credential")
+                    send_msg(client_sock, {"status": "error", "code": "ADMIN_AUTH_FAILED", "message": "Administrator authentication failed."})
+                    return None
 
                 if action == "quit":
                     logger.info("Client %s chose to quit during authentication.", client_addr)
@@ -331,19 +374,20 @@ class SecureSocketServer:
                         )
                         continue
 
-                    success = register_user(username, password)
+                    success = register_user(username, password, access_status="pending")
                     if success:
-                        self._audit("REGISTER_SUCCESS", client_addr, username)
+                        self._audit("ACCESS_REQUESTED", client_addr, username, "New account awaiting administrator review")
                         send_msg(
                             client_sock,
                             {
-                                "status": "ok",
+                                "status": "pending",
+                                "code": "PENDING_APPROVAL",
                                 "action": "register",
-                                "message": f"Registration successful. Welcome, {username}!",
+                                "message": f"Registration submitted for {username}. An administrator must approve access before you can enter the chat.",
                                 "username": username,
                             },
                         )
-                        return username
+                        return None
                     else:
                         self._audit("REGISTER_FAILED", client_addr, username, "Password too short (< 4 chars)")
                         send_msg(
@@ -385,6 +429,37 @@ class SecureSocketServer:
                     # Authenticate with brute-force protection & status
                     success, auth_msg, rem_lockout = authenticate_user_with_status(username, password)
                     if success:
+                        admitted, admission_code = activate_user_with_access_code(
+                            username, str(msg.get("access_code", ""))
+                        )
+                        if not admitted:
+                            admission_messages = {
+                                "PENDING_APPROVAL": ("pending", "Your request is waiting for administrator approval. Chat access is blocked."),
+                                "CODE_REQUIRED": ("error", "Administrator approval found. Enter your personal one-time access code to activate this account."),
+                                "INVALID_CODE": ("error", "Invalid administrator access code. Check the code and try again."),
+                                "CODE_EXPIRED": ("error", "Your invitation code expired. Ask the administrator to issue a new one."),
+                                "REJECTED": ("denied", "The administrator rejected this account request. Chat access is not allowed."),
+                                "REVOKED": ("denied", "This account's chat access has been revoked by the administrator."),
+                            }
+                            response_status, response_message = admission_messages.get(
+                                admission_code, ("denied", "Account is not authorized to enter the chat.")
+                            )
+                            if admission_code == "INVALID_CODE":
+                                self._audit("INVITE_FAILED", client_addr, username, "Invalid one-time invitation code")
+                            elif admission_code == "PENDING_APPROVAL":
+                                self._audit("ACCESS_PENDING", client_addr, username)
+                            else:
+                                self._audit("ACCESS_DENIED", client_addr, username, admission_code)
+                            send_msg(client_sock, {
+                                "status": response_status,
+                                "code": admission_code,
+                                "action": "login",
+                                "message": response_message,
+                            })
+                            if response_status in {"pending", "denied"}:
+                                return None
+                            continue
+
                         self._audit("LOGIN_SUCCESS", client_addr, username)
                         send_msg(
                             client_sock,
@@ -460,6 +535,74 @@ class SecureSocketServer:
             logger.warning("Auth error with client %s: %s", client_addr, exc)
             return None
 
+    def _handle_admin_client(
+        self,
+        admin_sock: ssl.SSLSocket,
+        client_addr: Tuple[str, int],
+    ) -> None:
+        """Serve one authenticated admin control request over the existing mTLS channel."""
+        try:
+            admin_sock.settimeout(15.0)
+            request = recv_msg(admin_sock)
+            if not request:
+                return
+            action = str(request.get("action", "")).strip()
+            username = str(request.get("username", "")).strip()[:64]
+
+            if action == "admin_list_users":
+                users = list_users_for_admin()
+                with self._clients_lock:
+                    online = sorted(self._clients.keys(), key=str.lower)
+                self._audit("ADMIN_VIEW_USERS", client_addr, "admin", f"Accounts: {len(users)} | Online: {len(online)}")
+                send_msg(admin_sock, {
+                    "status": "ok",
+                    "users": users,
+                    "online_users": online,
+                    "server_time": get_current_timestamp(),
+                })
+                return
+
+            if action == "admin_approve_user":
+                invitation = issue_access_invitation(username, ttl_minutes=10)
+                if not invitation:
+                    send_msg(admin_sock, {"status": "error", "message": "User not found or already active; approval was not changed."})
+                    return
+                self._audit("ACCESS_APPROVED", client_addr, username, "One-time invitation issued; expires in 10 minutes")
+                send_msg(admin_sock, {
+                    "status": "ok",
+                    "message": "User approved. Share this one-time access code with the intended user.",
+                    **invitation,
+                })
+                return
+
+            if action == "admin_reject_user":
+                if not reject_user_access(username):
+                    send_msg(admin_sock, {"status": "error", "message": "User could not be rejected. Active users must be revoked instead."})
+                    return
+                self._audit("ACCESS_REJECTED", client_addr, username, "Administrator rejected access request")
+                send_msg(admin_sock, {"status": "ok", "message": f"Access request for {username} rejected."})
+                return
+
+            if action == "admin_revoke_user":
+                if not revoke_user_access(username):
+                    send_msg(admin_sock, {"status": "error", "message": "User not found; access was not revoked."})
+                    return
+                self._client_pubkeys.pop(username, None)
+                self._remove_client(username)
+                self._audit("ACCESS_REVOKED", client_addr, username, "Administrator revoked account and any active session")
+                send_msg(admin_sock, {"status": "ok", "message": f"Access for {username} revoked."})
+                return
+
+            self._audit("ADMIN_ACTION_INVALID", client_addr, "admin", "Unknown control action")
+            send_msg(admin_sock, {"status": "error", "message": "Unknown administrator action."})
+        except (ConnectionResetError, ssl.SSLError, OSError, socket.timeout) as exc:
+            logger.warning("Admin control request from %s failed: %s", client_addr, exc)
+        finally:
+            try:
+                admin_sock.close()
+            except OSError:
+                pass
+
     def _handle_client(
         self,
         tls_sock: ssl.SSLSocket,
@@ -475,6 +618,9 @@ class SecureSocketServer:
         try:
             # 1. Authenticate client
             username = self._authenticate_client(tls_sock, client_addr)
+            if username == ADMIN_SESSION:
+                self._handle_admin_client(tls_sock, client_addr)
+                return
             if not username:
                 return
 
@@ -500,6 +646,15 @@ class SecureSocketServer:
                 msg = recv_msg(tls_sock)
                 if msg is None:
                     # Client disconnected cleanly
+                    break
+
+                # Re-check admission on every application request; this is a server-side authorization gate.
+                if not is_user_active(username):
+                    self._audit("ACCESS_ENFORCEMENT_BLOCK", client_addr, username, "Inactive account attempted an application action")
+                    try:
+                        send_msg(tls_sock, {"type": "error", "message": "Administrator access has been revoked. Disconnecting."})
+                    except OSError:
+                        pass
                     break
 
                 action = msg.get("action", "chat")
@@ -825,7 +980,7 @@ class SecureSocketServer:
         except (ConnectionResetError, ssl.SSLError, OSError) as exc:
             logger.warning("Connection lost with client %s (%s): %s", username or "unauthenticated", client_addr, exc)
         finally:
-            if username:
+            if username and username != ADMIN_SESSION:
                 self._remove_client(username)
                 self._audit("USER_LEFT", client_addr, username)
                 logger.info("User '%s' disconnected.", username)

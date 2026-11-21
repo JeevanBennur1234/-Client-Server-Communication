@@ -277,11 +277,16 @@ class SecureSocketClient:
                         print("Password cannot be blank.")
                     continue
 
-                # Send authentication payload
+                access_code = ""
+                if action == "login":
+                    access_code = getpass.getpass("Admin one-time access code (leave blank if already activated): ").strip()
+
+                # Send authentication payload; active users do not need the one-time code again.
                 auth_payload = {
                     "action": action,
                     "username": username,
                     "password": password,
+                    "access_code": access_code,
                 }
                 send_msg(self._sock, auth_payload)
 
@@ -299,6 +304,13 @@ class SecureSocketClient:
 
                 status = response.get("status")
                 message = response.get("message", "")
+
+                if status in {"pending", "denied"}:
+                    if HAS_RICH and console is not None:
+                        console.print(f"\n[bold yellow]{message}[/bold yellow]\n")
+                    else:
+                        print(f"\n{message}\n")
+                    return False
 
                 if status == "ok":
                     self.username = response.get("username", username)

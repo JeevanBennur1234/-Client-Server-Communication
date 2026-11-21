@@ -332,6 +332,30 @@ class SecureSocketGUI:
         self.entry_password.pack(fill=tk.X, pady=(4, 12), ipady=4)
         self.entry_password.bind("<Return>", lambda event: self._on_auth_submit())
 
+        # One-time invitation code issued by the administrator after approval.
+        self.invite_frame = tk.Frame(form_frame, bg=BG_SURFACE)
+        tk.Label(
+            self.invite_frame,
+            text="Admin One-Time Access Code (after approval)",
+            bg=BG_SURFACE,
+            fg=FG_TEXT,
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X)
+        self.entry_access_code = tk.Entry(
+            self.invite_frame,
+            bg=BG_INPUT,
+            fg=FG_TEXT,
+            insertbackground=FG_TEXT,
+            font=("Segoe UI", 10),
+            show="•",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+        )
+        self.entry_access_code.pack(fill=tk.X, pady=(4, 12), ipady=4)
+        self.invite_frame.pack(fill=tk.X, after=self.password_frame)
+
         # Confirm Password Frame (Hidden during login, visible during registration)
         self.confirm_frame = tk.Frame(form_frame, bg=BG_SURFACE)
 
@@ -416,6 +440,7 @@ class SecureSocketGUI:
             self.tab_login_btn.config(bg=ACCENT_BLUE, fg="#11111b")
             self.tab_reg_btn.config(bg=BG_INPUT, fg=FG_TEXT)
             self.confirm_frame.pack_forget()
+            self.invite_frame.pack(fill=tk.X, after=self.password_frame)
             self.lbl_password_title.config(text="Password")
             self.btn_submit.config(text="Log In (Enter ↵)", bg=ACCENT_BLUE)
             self.lbl_mode_hint.config(text="New here? Click 'Register New Account' above.")
@@ -424,6 +449,7 @@ class SecureSocketGUI:
             self.tab_login_btn.config(bg=BG_INPUT, fg=FG_TEXT)
             self.tab_reg_btn.config(bg=ACCENT_GREEN, fg="#11111b")
             self.lbl_password_title.config(text="Password (min 4 characters)")
+            self.invite_frame.pack_forget()
             self.confirm_frame.pack(fill=tk.X, after=self.password_frame)
             self.btn_submit.config(text="Create Account & Join (Enter ↵)", bg=ACCENT_GREEN)
             self.lbl_mode_hint.config(text="Already have an account? Click 'Log In' above.")
@@ -714,6 +740,7 @@ class SecureSocketGUI:
         action = self.auth_mode
         username = self.entry_username.get().strip()
         password = self.entry_password.get()
+        access_code = self.entry_access_code.get().strip() if action == "login" else ""
 
         if not username:
             self._set_auth_status("Username cannot be empty.", is_error=True)
@@ -746,11 +773,11 @@ class SecureSocketGUI:
         # Launch authentication worker thread
         threading.Thread(
             target=self._auth_worker,
-            args=(action, username, password),
+            args=(action, username, password, access_code),
             daemon=True,
         ).start()
 
-    def _auth_worker(self, action: str, username: str, password: str) -> None:
+    def _auth_worker(self, action: str, username: str, password: str, access_code: str = "") -> None:
         try:
             # 1. Establish TLS connection with client certificate presentation
             if self.sock is None:
@@ -773,6 +800,7 @@ class SecureSocketGUI:
                 "action": action,
                 "username": username,
                 "password": password,
+                "access_code": access_code,
             }
             send_msg(self.sock, auth_payload)
 
@@ -806,9 +834,11 @@ class SecureSocketGUI:
                 send_msg(self.sock, {"action": "users"})
 
             else:
-                # Auth failed or account locked
+                # Pending/rejected accounts are closed by the server; code errors keep the auth socket open for retry.
                 lock_text = f" (Locked for {rem_lockout}s)" if rem_lockout > 0 else ""
                 self.msg_queue.put(("AUTH_ERROR", f"{msg}{lock_text}"))
+                if status in {"pending", "denied"}:
+                    self._cleanup_socket()
 
         except ssl.SSLError as exc:
             self.msg_queue.put(("AUTH_ERROR", f"TLS Handshake Failed: {exc}"))

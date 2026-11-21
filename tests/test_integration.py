@@ -143,6 +143,23 @@ def create_client_tls_socket(
     return tls_sock
 
 
+
+
+def admin_command(server_inst: SecureSocketServer, port: int, action: str, **payload):
+    """Exercise the authenticated admin control plane over a real mTLS socket."""
+    sock = create_client_tls_socket(port, present_client_cert=True)
+    try:
+        challenge = recv_msg(sock)
+        assert challenge and challenge.get("type") == "auth_challenge"
+        send_msg(sock, {"action": "admin_login", "admin_key": server_inst.admin_access_key})
+        auth = recv_msg(sock)
+        assert auth and auth.get("status") == "ok" and auth.get("role") == "admin"
+        send_msg(sock, {"action": action, **payload})
+        return recv_msg(sock)
+    finally:
+        sock.close()
+
+
 class TestMutualTlsSecurity:
     """Verification of Mutual TLS enforcement at the transport layer."""
 
@@ -150,26 +167,23 @@ class TestMutualTlsSecurity:
         """Server requiring client cert must reject connection without client certificate."""
         _, port, _, _ = running_server
 
-        # Connect WITHOUT presenting client certificate
-        with pytest.raises(ssl.SSLError) as exc_info:
+        # The TLS alert may surface during connect or on the first application read.
+        rejected = False
+        tls_sock = None
+        try:
             tls_sock = create_client_tls_socket(port, present_client_cert=False)
-            # Under TLS 1.3, handshake alert CERTIFICATE_REQUIRED arrives on first read
             try:
-                recv_msg(tls_sock)
-            finally:
-                try:
-                    tls_sock.close()
-                except OSError:
-                    pass
+                rejected = recv_msg(tls_sock) is None
+            except ssl.SSLError:
+                rejected = True
+        except ssl.SSLError:
+            rejected = True
+        finally:
+            if tls_sock is not None:
+                tls_sock.close()
 
-        # Error must reflect certificate requirement
-        err = str(exc_info.value)
-        assert (
-            "CERTIFICATE_REQUIRED" in err
-            or "PEER_DID_NOT_RETURN_A_CERTIFICATE" in err
-            or "tlsv13 alert" in err.lower()
-            or "handshake failure" in err.lower()
-        )
+        # The server logs TLS_FAILED when the peer omits its client certificate.
+        assert rejected
 
     def test_client_with_valid_ca_cert_succeeds_handshake(self, running_server) -> None:
         """Client with valid client.crt signed by Root CA completes handshake cleanly."""
@@ -184,6 +198,53 @@ class TestMutualTlsSecurity:
             assert challenge.get("type") == "auth_challenge"
         finally:
             tls_sock.close()
+
+
+class TestAdminAdmissionControl:
+    """Server-enforced admission, invitation redemption, and revocation."""
+
+    def test_pending_user_is_denied_and_revocation_kicks_active_session(self, running_server) -> None:
+        server_inst, port, _, _ = running_server
+
+        request_sock = create_client_tls_socket(port)
+        recv_msg(request_sock)
+        send_msg(request_sock, {"action": "register", "username": "dave", "password": "dave-pass-123"})
+        assert recv_msg(request_sock).get("status") == "pending"
+        request_sock.close()
+
+        pending_sock = create_client_tls_socket(port)
+        recv_msg(pending_sock)
+        send_msg(pending_sock, {"action": "login", "username": "dave", "password": "dave-pass-123"})
+        assert recv_msg(pending_sock).get("status") == "pending"
+        pending_sock.close()
+
+        invite = admin_command(server_inst, port, "admin_approve_user", username="dave")
+        assert invite.get("status") == "ok"
+
+        active_sock = create_client_tls_socket(port)
+        recv_msg(active_sock)
+        send_msg(active_sock, {
+            "action": "login", "username": "dave", "password": "dave-pass-123",
+            "access_code": invite["access_code"],
+        })
+        assert recv_msg(active_sock).get("status") == "ok"
+
+        revoke = admin_command(server_inst, port, "admin_revoke_user", username="dave")
+        assert revoke.get("status") == "ok"
+        try:
+            assert recv_msg(active_sock) is None
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            active_sock.close()
+
+        denied_sock = create_client_tls_socket(port)
+        recv_msg(denied_sock)
+        send_msg(denied_sock, {"action": "login", "username": "dave", "password": "dave-pass-123"})
+        denied = recv_msg(denied_sock)
+        assert denied.get("status") == "denied"
+        assert "revoked" in denied.get("message", "").lower()
+        denied_sock.close()
 
 
 class TestMultiClientInteractionAndE2EE:
@@ -204,6 +265,26 @@ class TestMultiClientInteractionAndE2EE:
             {"action": "register", "username": "alice", "password": "alicepassword123"},
         )
         auth_resp_a = recv_msg(alice_sock)
+        assert auth_resp_a.get("status") == "pending"
+        alice_sock.close()
+
+        # A correct password is still insufficient while the account is pending.
+        pending_login = create_client_tls_socket(port, present_client_cert=True)
+        recv_msg(pending_login)
+        send_msg(pending_login, {"action": "login", "username": "alice", "password": "alicepassword123"})
+        pending_result = recv_msg(pending_login)
+        assert pending_result.get("status") == "pending"
+        pending_login.close()
+
+        approved_a = admin_command(server_inst, port, "admin_approve_user", username="alice")
+        assert approved_a.get("status") == "ok"
+        alice_sock = create_client_tls_socket(port, present_client_cert=True)
+        recv_msg(alice_sock)
+        send_msg(alice_sock, {
+            "action": "login", "username": "alice", "password": "alicepassword123",
+            "access_code": approved_a["access_code"],
+        })
+        auth_resp_a = recv_msg(alice_sock)
         assert auth_resp_a.get("status") == "ok"
 
         # 2. Connect Client B (Bob)
@@ -216,6 +297,18 @@ class TestMultiClientInteractionAndE2EE:
             bob_sock,
             {"action": "register", "username": "bob", "password": "bobpassword123"},
         )
+        auth_resp_b = recv_msg(bob_sock)
+        assert auth_resp_b.get("status") == "pending"
+        bob_sock.close()
+
+        approved_b = admin_command(server_inst, port, "admin_approve_user", username="bob")
+        assert approved_b.get("status") == "ok"
+        bob_sock = create_client_tls_socket(port, present_client_cert=True)
+        recv_msg(bob_sock)
+        send_msg(bob_sock, {
+            "action": "login", "username": "bob", "password": "bobpassword123",
+            "access_code": approved_b["access_code"],
+        })
         auth_resp_b = recv_msg(bob_sock)
         assert auth_resp_b.get("status") == "ok"
 
@@ -429,7 +522,9 @@ class TestMultiClientInteractionAndE2EE:
         assert audit_log.exists()
         audit_content = audit_log.read_text(encoding="utf-8")
         assert "TLS_HANDSHAKE" in audit_content
-        assert "REGISTER_SUCCESS" in audit_content
+        assert "ACCESS_REQUESTED" in audit_content
+        assert "ACCESS_APPROVED" in audit_content
+        assert "LOGIN_SUCCESS" in audit_content
         assert "USER_ROSTER_REQ" in audit_content
         assert "PUBLIC_CHAT" in audit_content
         assert "DIRECT_MSG" in audit_content

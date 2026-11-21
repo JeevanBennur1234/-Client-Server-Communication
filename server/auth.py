@@ -9,12 +9,15 @@ across concurrent socket client connections.
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import bcrypt
 
@@ -130,6 +133,12 @@ def _load_users_unlocked(db_path: Path) -> Dict[str, Dict[str, Any]]:
                 # Ensure brute-force tracking fields are present
                 record.setdefault("failed_attempts", 0)
                 record.setdefault("lockout_until", None)
+                # Fail closed for accounts created before admin admission was introduced.
+                record.setdefault("access_status", "pending")
+                record.setdefault("invite_code_hash", None)
+                record.setdefault("invite_expires_at", None)
+                record.setdefault("approved_at", None)
+                record.setdefault("activated_at", None)
                 normalized[username] = record
             else:
                 logger.warning("Skipping malformed user record for %s", username)
@@ -178,6 +187,8 @@ def register_user(
     username: str,
     password: str,
     db_path: Path | str | None = None,
+    *,
+    access_status: str = "pending",
 ) -> bool:
     """Register a new user with a hashed password in a thread-safe manner.
 
@@ -216,11 +227,20 @@ def register_user(
             logger.error("Failed to hash password during registration: %s", exc)
             return False
 
+        if access_status not in {"pending", "invited", "active"}:
+            logger.warning("Registration failed: invalid access status.")
+            return False
+
         users[clean_username] = {
             "password_hash": pw_hash,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "failed_attempts": 0,
             "lockout_until": None,
+            "access_status": access_status,
+            "invite_code_hash": None,
+            "invite_expires_at": None,
+            "approved_at": None,
+            "activated_at": datetime.datetime.now(datetime.timezone.utc).isoformat() if access_status == "active" else None,
         }
 
         if _save_users_unlocked(users, target_path):
@@ -459,6 +479,178 @@ def user_exists(username: str, db_path: Path | str | None = None) -> bool:
     return False
 
 
+
+
+def _find_user_record_unlocked(users: Dict[str, Dict[str, Any]], username: str):
+    """Return (canonical username, record), matching usernames case-insensitively."""
+    clean = username.strip().lower()
+    for canonical, record in users.items():
+        if canonical.lower() == clean:
+            return canonical, record
+    return None, None
+
+
+def get_user_access_status(username: str, db_path: Path | str | None = None) -> str | None:
+    """Return a user's admission status without exposing credential metadata."""
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        _, record = _find_user_record_unlocked(users, username)
+        return str(record.get("access_status", "pending")) if record else None
+
+
+def list_users_for_admin(db_path: Path | str | None = None) -> list[Dict[str, Any]]:
+    """Return safe user metadata for the admin dashboard; never return hashes."""
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        result = []
+        for username, record in users.items():
+            result.append({
+                "username": username,
+                "status": str(record.get("access_status", "pending")),
+                "created_at": record.get("created_at"),
+                "approved_at": record.get("approved_at"),
+                "activated_at": record.get("activated_at"),
+            })
+        return sorted(result, key=lambda item: item["username"].lower())
+
+
+def issue_access_invitation(
+    username: str,
+    db_path: Path | str | None = None,
+    *,
+    ttl_minutes: int = 10,
+) -> Dict[str, str] | None:
+    """Approve a pending account and create a random, one-use activation code.
+
+    Only the SHA-256 digest is persisted. The plaintext code is returned exactly
+    once to the authenticated administrator.
+    """
+    if not isinstance(username, str) or not username.strip() or not 1 <= ttl_minutes <= 60:
+        return None
+
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        canonical, record = _find_user_record_unlocked(users, username)
+        if record is None:
+            return None
+        current_status = str(record.get("access_status", "pending"))
+        if current_status == "active":
+            return None
+        code = secrets.token_urlsafe(18)
+        expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=ttl_minutes)
+        record["access_status"] = "invited"
+        record["invite_code_hash"] = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        record["invite_expires_at"] = expires.isoformat()
+        record["approved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        record["activated_at"] = None
+        if not _save_users_unlocked(users, target_path):
+            return None
+        logger.info("Admin approved access for '%s'; one-time invitation issued.", canonical)
+        return {"username": canonical, "access_code": code, "expires_at": expires.isoformat()}
+
+
+def activate_user_with_access_code(
+    username: str,
+    access_code: str = "",
+    db_path: Path | str | None = None,
+) -> tuple[bool, str]:
+    """Authorize an already password-authenticated user or redeem their invite.
+
+    Returns (allowed, reason_code). The one-time invitation is consumed atomically.
+    """
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        canonical, record = _find_user_record_unlocked(users, username)
+        if record is None:
+            return False, "UNKNOWN_USER"
+
+        status = str(record.get("access_status", "pending"))
+        if status == "active":
+            record["last_login_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _save_users_unlocked(users, target_path)
+            return True, "ACTIVE"
+        if status == "pending":
+            return False, "PENDING_APPROVAL"
+        if status == "rejected":
+            return False, "REJECTED"
+        if status == "revoked":
+            return False, "REVOKED"
+        if status != "invited":
+            return False, "ACCESS_DENIED"
+        if not access_code:
+            return False, "CODE_REQUIRED"
+
+        expires_raw = record.get("invite_expires_at")
+        try:
+            expires = datetime.datetime.fromisoformat(str(expires_raw))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=datetime.timezone.utc)
+        except (TypeError, ValueError):
+            expires = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now >= expires:
+            record["access_status"] = "pending"
+            record["invite_code_hash"] = None
+            record["invite_expires_at"] = None
+            _save_users_unlocked(users, target_path)
+            return False, "CODE_EXPIRED"
+
+        supplied_hash = hashlib.sha256(str(access_code).encode("utf-8")).hexdigest()
+        expected_hash = str(record.get("invite_code_hash") or "")
+        if not expected_hash or not hmac.compare_digest(supplied_hash, expected_hash):
+            return False, "INVALID_CODE"
+
+        record["access_status"] = "active"
+        record["invite_code_hash"] = None
+        record["invite_expires_at"] = None
+        record["activated_at"] = now.isoformat()
+        record["last_login_at"] = now.isoformat()
+        if not _save_users_unlocked(users, target_path):
+            return False, "PERSISTENCE_ERROR"
+        logger.info("User '%s' redeemed their one-time invitation and is now active.", canonical)
+        return True, "ACTIVATED"
+
+
+def reject_user_access(username: str, db_path: Path | str | None = None) -> bool:
+    """Reject a pending/invited user and invalidate any outstanding invitation."""
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        _, record = _find_user_record_unlocked(users, username)
+        if record is None or str(record.get("access_status", "pending")) == "active":
+            return False
+        record["access_status"] = "rejected"
+        record["invite_code_hash"] = None
+        record["invite_expires_at"] = None
+        record["rejected_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return _save_users_unlocked(users, target_path)
+
+
+def revoke_user_access(username: str, db_path: Path | str | None = None) -> bool:
+    """Revoke an account and invalidate any outstanding invitation."""
+    target_path = _resolve_db_path(db_path)
+    with _DB_LOCK:
+        users = _load_users_unlocked(target_path)
+        _, record = _find_user_record_unlocked(users, username)
+        if record is None:
+            return False
+        record["access_status"] = "revoked"
+        record["invite_code_hash"] = None
+        record["invite_expires_at"] = None
+        record["revoked_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return _save_users_unlocked(users, target_path)
+
+
+def is_user_active(username: str, db_path: Path | str | None = None) -> bool:
+    """Fail-closed authorization check used before chat and transfer operations."""
+    return get_user_access_status(username, db_path) == "active"
+
+
 __all__ = [
     "DEFAULT_USERS_FILE",
     "MAX_FAILED_ATTEMPTS",
@@ -470,4 +662,11 @@ __all__ = [
     "authenticate_user_with_status",
     "is_account_locked",
     "user_exists",
+    "get_user_access_status",
+    "list_users_for_admin",
+    "issue_access_invitation",
+    "activate_user_with_access_code",
+    "reject_user_access",
+    "revoke_user_access",
+    "is_user_active",
 ]
